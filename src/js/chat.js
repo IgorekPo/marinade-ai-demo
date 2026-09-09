@@ -112,6 +112,11 @@ function sanitizeLastRecommendation(value) {
     parameters: {
       type: ['dry', 'liquid'].includes(value.parameters?.type) ? value.parameters.type : null,
       color: ['yellow', 'red', 'green'].includes(value.parameters?.color) ? value.parameters.color : null,
+      flavors: Array.isArray(value.parameters?.flavors)
+        ? value.parameters.flavors.filter((flavor) => typeof flavor === 'string').slice(0, 8)
+        : [],
+      sweetness: Number.isFinite(value.parameters?.sweetness) ? value.parameters.sweetness : null,
+      spiciness: Number.isFinite(value.parameters?.spiciness) ? value.parameters.spiciness : null,
     },
   };
 }
@@ -264,7 +269,7 @@ export function initChat() {
       saveChatSession(window.sessionStorage, chatSession);
       messages.scrollTop = messages.scrollHeight;
     } catch {
-      const errorMessage = 'AI-помічник тимчасово недоступний. Ви все ще можете переглянути каталог маринадів самостійно.';
+      const errorMessage = 'Не вдалося точно визначити ваш запит. Уточніть, будь ласка, для якого продукту та який тип маринаду вам потрібен.';
       addMessage(
         messages,
         errorMessage,

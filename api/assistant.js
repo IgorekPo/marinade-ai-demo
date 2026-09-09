@@ -9,7 +9,18 @@ import {
 
 const catalogById = new Map(marinades.map((product) => [product.id, product]));
 const MAX_MESSAGE_LENGTH = 1500;
-const MAX_HISTORY_MESSAGES = 6;
+const MAX_HISTORY_MESSAGES = 4;
+const MAX_HISTORY_CONTENT_LENGTH = 600;
+const compactCatalog = marinades.map((product) => ({
+  id: product.id,
+  name: product.name,
+  type: product.type,
+  protein: product.meat,
+  color: product.color,
+  tastes: product.flavors,
+  spicy: product.spiciness,
+  sweet: product.sweetness,
+}));
 
 const responseSchema = {
   type: 'object',
@@ -63,7 +74,7 @@ ${JSON.stringify(proteinGroupsForPrompt)}
 
 # Каталог
 
-${JSON.stringify(marinades)}
+${JSON.stringify(compactCatalog)}
 
 # Фінальна вимога
 
@@ -81,7 +92,7 @@ function safeHistory(history) {
   return history
     .slice(-MAX_HISTORY_MESSAGES)
     .filter((item) => item && ['user', 'assistant'].includes(item.role) && typeof item.content === 'string')
-    .map((item) => ({ role: item.role, content: item.content.slice(0, MAX_MESSAGE_LENGTH) }));
+    .map((item) => ({ role: item.role, content: item.content.slice(0, MAX_HISTORY_CONTENT_LENGTH) }));
 }
 
 function mapValidatedProducts(productIds) {
@@ -156,7 +167,6 @@ function toBrowserResponse(result, source = 'groq', preferences = null) {
     message,
     question: result.needsClarification ? question : null,
     products,
-    source,
     recommendationContext: result.needsClarification ? null : createRecommendationContext(preferences, products),
   };
 }
@@ -225,10 +235,40 @@ function emptyPreferences() {
   };
 }
 
-function mergeConversationPreferences(history, message) {
-  const preferences = emptyPreferences();
+function preferencesFromLastRecommendation(lastRecommendation) {
+  if (!lastRecommendation) return emptyPreferences();
+  const intent = getProteinIntentById(lastRecommendation.requestedProtein);
+  if (!intent) return emptyPreferences();
+
+  return {
+    meat: intent.catalogMeat,
+    proteinIntent: intent,
+    type: lastRecommendation.parameters?.type || null,
+    color: lastRecommendation.parameters?.color || null,
+    unsupportedColor: null,
+    flavors: [...(lastRecommendation.parameters?.flavors || [])],
+    sweetness: lastRecommendation.parameters?.sweetness ?? null,
+    spiciness: lastRecommendation.parameters?.spiciness ?? null,
+  };
+}
+
+function historyAfterLastRecommendation(history, lastRecommendation) {
+  if (!lastRecommendation) return history;
+  for (let index = history.length - 1; index >= 0; index -= 1) {
+    if (history[index].role === 'assistant' && history[index].content.includes('Рекомендовані productIds:')) {
+      return history.slice(index + 1);
+    }
+  }
+  return [];
+}
+
+function mergeConversationPreferences(history, message, lastRecommendation = null) {
+  const preferences = preferencesFromLastRecommendation(lastRecommendation);
+  const relevantHistory = historyAfterLastRecommendation(history, lastRecommendation);
   const userMessages = [
-    ...history.filter((item) => item.role === 'user').map((item) => item.content),
+    ...relevantHistory
+      .filter((item) => item.role === 'user' && !isQuestionAboutLastRecommendation(item.content, lastRecommendation))
+      .map((item) => item.content),
     message,
   ];
 
@@ -282,7 +322,12 @@ function sanitizeLastRecommendation(value) {
     parameters: value.parameters && typeof value.parameters === 'object' ? {
       type: ['dry', 'liquid'].includes(value.parameters.type) ? value.parameters.type : null,
       color: ['yellow', 'red', 'green'].includes(value.parameters.color) ? value.parameters.color : null,
-    } : { type: null, color: null },
+      flavors: Array.isArray(value.parameters.flavors)
+        ? value.parameters.flavors.filter((flavor) => typeof flavor === 'string').slice(0, 8)
+        : [],
+      sweetness: Number.isFinite(value.parameters.sweetness) ? value.parameters.sweetness : null,
+      spiciness: Number.isFinite(value.parameters.spiciness) ? value.parameters.spiciness : null,
+    } : { type: null, color: null, flavors: [], sweetness: null, spiciness: null },
   };
 }
 
@@ -298,6 +343,14 @@ function isQuestionAboutLastRecommendation(text, lastRecommendation) {
     'чому для', 'почему для', 'це ж для', 'это же для', 'але він для', 'но он для',
     'але це для', 'но это для', 'хіба це', 'разве это',
     'підійде', 'підходить', 'подойдет', 'почему вы рекомендовали', 'чому ви порадили',
+  ]);
+}
+
+function isAlternativeRequest(text) {
+  const normalized = text.toLocaleLowerCase('uk-UA').replace(/[’']/g, '');
+  return includesAny(normalized, [
+    'інший варіант', 'інший маринад', 'ще варіант', 'ще один',
+    'другой вариант', 'другой маринад', 'есть другой', 'є інший',
   ]);
 }
 
@@ -318,7 +371,6 @@ function unsupportedColorResponse(preferences) {
     message: 'Чорних маринадів у каталозі немає.',
     question: 'Який колір оберете: червоний, жовтий чи зелений?',
     products: [],
-    source: 'local',
     recommendationContext: null,
   };
 }
@@ -338,6 +390,11 @@ function compatibilityExplanation(intent) {
 function rankProducts(preferences) {
   let candidates = marinades.filter((product) => productProteinScore(product, preferences.proteinIntent) > 0);
   if (!candidates.length) candidates = [...marinades];
+
+  const excludedIds = new Set(preferences.excludedProductIds || []);
+  if (excludedIds.size && candidates.some((product) => !excludedIds.has(product.id))) {
+    candidates = candidates.filter((product) => !excludedIds.has(product.id));
+  }
 
   if (preferences.type && candidates.some((product) => product.type === preferences.type)) {
     candidates = candidates.filter((product) => product.type === preferences.type);
@@ -371,11 +428,29 @@ function hasUsefulPreferences(preferences) {
   );
 }
 
-function buildCompatibilityContext(preferences) {
+function buildCompatibilityContext(preferences, lastRecommendation = null) {
   const intent = preferences.proteinIntent;
-  if (!intent) return 'Сервер не визначив продукт або сумісну білкову категорію. За потреби постав одне уточнювальне питання.';
+  const conversationContext = {
+    requestedProtein: intent?.protein || null,
+    catalogProtein: intent?.catalogMeat || null,
+    proteinGroup: intent?.proteinGroup || null,
+    matchType: intent ? (intent.isExactCatalogProtein ? 'exact' : 'compatible') : null,
+    preferences: {
+      type: preferences.type,
+      color: preferences.color,
+      tastes: preferences.flavors,
+      spicy: preferences.spiciness,
+      sweet: preferences.sweetness,
+    },
+    lastRecommendation: lastRecommendation ? {
+      productIds: lastRecommendation.productIds,
+      requestedProtein: lastRecommendation.requestedProtein,
+      catalogProtein: lastRecommendation.catalogProtein,
+      matchType: lastRecommendation.matchType,
+    } : null,
+  };
 
-  return `Серверний аналіз продукту: requestedProtein=${intent.protein}; proteinGroup=${intent.proteinGroup}; catalogMeat=${intent.catalogMeat}; exactCatalogProtein=${intent.isExactCatalogProtein}. ${intent.isExactCatalogProtein ? 'Це точна категорія каталогу.' : 'Це сумісна заміна: обов’язково поясни її користувачу й не відмовляй у підборі.'}`;
+  return `Структурований стан поточного діалогу: ${JSON.stringify(conversationContext)}. Використовуй цей стан як основне джерело вже визначених параметрів. ${intent && !intent.isExactCatalogProtein ? 'Рекомендація використовує сумісну категорію — чітко поясни це користувачу.' : ''}`;
 }
 
 function localFallback(message, history, preparedPreferences = null) {
@@ -386,7 +461,7 @@ function localFallback(message, history, preparedPreferences = null) {
 
   if (!preferences.meat) {
     return toBrowserResponse({
-      message: 'Зараз використовую локальний підбір.',
+      message: 'Щоб точніше підібрати маринад, уточніть один момент.',
       needsClarification: true,
       question: 'Для якого продукту потрібен маринад: курки, свинини чи риби?',
       productIds: [],
@@ -395,7 +470,7 @@ function localFallback(message, history, preparedPreferences = null) {
 
   if (!hasUsefulDetail) {
     return toBrowserResponse({
-      message: 'Зараз використовую локальний підбір.',
+      message: 'Щоб точніше підібрати маринад, уточніть один момент.',
       needsClarification: true,
       question: 'Вам потрібен сухий чи рідкий маринад?',
       productIds: [],
@@ -410,6 +485,33 @@ function localFallback(message, history, preparedPreferences = null) {
     question: null,
     productIds: scored.map(({ id }) => id),
   }, 'fallback', preferences);
+}
+
+function readErrorHeader(headers, name) {
+  if (!headers) return null;
+  if (typeof headers.get === 'function') return headers.get(name);
+  const key = Object.keys(headers).find((header) => header.toLocaleLowerCase('en-US') === name);
+  const value = key ? headers[key] : null;
+  return Array.isArray(value) ? value[0] : value || null;
+}
+
+function providerErrorDetails(error) {
+  const status = Number.isInteger(error?.status) ? error.status : null;
+  const rawMessage = error?.error?.message || error?.message || 'Unknown provider error';
+  return {
+    status,
+    type: error?.constructor?.name || typeof error,
+    message: String(rawMessage).replace(/\s+/g, ' ').slice(0, 300),
+    is429: status === 429,
+    is401: status === 401,
+    is400Or422: status === 400 || status === 422,
+    is5xx: status !== null && status >= 500 && status <= 599,
+    retryAfter: readErrorHeader(error?.headers, 'retry-after'),
+  };
+}
+
+function logProviderError(error) {
+  console.error('[AI_PROVIDER_ERROR]', providerErrorDetails(error));
 }
 
 export default async function handler(request, response) {
@@ -435,12 +537,14 @@ export default async function handler(request, response) {
       message: explainLastRecommendation(lastRecommendation),
       question: null,
       products: [],
-      source: 'local-context',
       recommendationContext: lastRecommendation,
     });
   }
 
-  const preferences = mergeConversationPreferences(history, message);
+  const preferences = mergeConversationPreferences(history, message, lastRecommendation);
+  if (isAlternativeRequest(message) && lastRecommendation) {
+    preferences.excludedProductIds = lastRecommendation.productIds;
+  }
   if (preferences.unsupportedColor) {
     return sendJson(response, 200, unsupportedColorResponse(preferences));
   }
@@ -450,15 +554,23 @@ export default async function handler(request, response) {
   }
 
   try {
-    const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+    const groq = new Groq({ apiKey: process.env.GROQ_API_KEY, maxRetries: 0 });
+    const providerMessages = [
+      { role: 'system', content: systemInstruction },
+      { role: 'system', content: buildCompatibilityContext(preferences, lastRecommendation) },
+      ...history,
+      { role: 'user', content: message },
+    ];
+    if (process.env.NODE_ENV !== 'production') {
+      console.info('[AI_REQUEST_DIAGNOSTICS]', {
+        messagesCount: providerMessages.length,
+        catalogProductsCount: compactCatalog.length,
+      });
+    }
+
     const completion = await groq.chat.completions.create({
       model: 'openai/gpt-oss-20b',
-      messages: [
-        { role: 'system', content: systemInstruction },
-        { role: 'system', content: buildCompatibilityContext(preferences) },
-        ...history,
-        { role: 'user', content: message },
-      ],
+      messages: providerMessages,
       response_format: {
         type: 'json_schema',
         json_schema: {
@@ -492,7 +604,7 @@ export default async function handler(request, response) {
 
     return sendJson(response, 200, safeResult);
   } catch (error) {
-    console.error('Groq assistant request failed:', error instanceof Error ? error.message : 'Unknown error');
+    logProviderError(error);
     return sendJson(response, 200, localFallback(message, history, preferences));
   }
 }
