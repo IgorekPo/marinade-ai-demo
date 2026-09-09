@@ -1,6 +1,7 @@
 import Groq from 'groq-sdk';
 import { marinades } from '../data/marinades.js';
 import {
+  getProteinIntentById,
   productProteinScore,
   proteinGroupsForPrompt,
   resolveProteinIntent,
@@ -52,6 +53,9 @@ const systemInstruction = `# Роль
 - Для індички, качки, гуски або перепілки використовуй каталогову категорію chicken як найближчу для птиці.
 - Для яловичини, телятини, баранини або ягнятини використовуй каталогову категорію pork як найближчу для червоного м'яса.
 - Для конкретних видів риби використовуй каталогову категорію fish.
+- Зберігай уже названі параметри запиту між репліками. Нове значення того самого параметра замінює попереднє: наприклад, «червоний» після «чорний» означає актуальний червоний колір, а тип і продукт зберігаються.
+- Якщо користувач запитує, чому в рекомендованій картці вказано інший продукт, поясни попередню сумісну рекомендацію. Не сприймай назву продукту з такого питання як новий запит і не запускай новий підбір, якщо користувач прямо не просить інший варіант.
+- У поясненні сумісності чітко розрізняй requestedProtein користувача, catalogProtein картки та matchType. Не називай сумісну рекомендацію точним збігом.
 
 # Контрольовані групи сумісності
 
@@ -106,6 +110,32 @@ function mapValidatedProducts(productIds) {
     });
 }
 
+function createRecommendationContext(preferences, products) {
+  const intent = preferences?.proteinIntent;
+  if (!intent || !products.length) return null;
+
+  return {
+    requestedProtein: intent.protein,
+    requestedProteinLabel: intent.proteinLabel,
+    requestedProteinGenitive: intent.proteinGenitive,
+    catalogProtein: products[0].meat,
+    matchType: intent.isExactCatalogProtein ? 'exact' : 'compatible',
+    proteinGroup: intent.proteinGroup,
+    proteinGroupLabel: intent.proteinGroupLabel,
+    compatibilityReason: intent.isExactCatalogProtein
+      ? `Товар належить до запитаної категорії «${intent.proteinGroupLabel}».`
+      : `У каталозі немає окремої категорії для ${intent.proteinGenitive}, тому використано сумісну категорію «${intent.proteinGroupLabel}».`,
+    productIds: products.map((product) => product.id),
+    parameters: {
+      type: preferences.type,
+      color: preferences.color,
+      flavors: preferences.flavors,
+      sweetness: preferences.sweetness,
+      spiciness: preferences.spiciness,
+    },
+  };
+}
+
 function toBrowserResponse(result, source = 'groq', preferences = null) {
   if (!result || typeof result.message !== 'string' || typeof result.needsClarification !== 'boolean') {
     throw new Error('Malformed structured response');
@@ -127,6 +157,7 @@ function toBrowserResponse(result, source = 'groq', preferences = null) {
     question: result.needsClarification ? question : null,
     products,
     source,
+    recommendationContext: result.needsClarification ? null : createRecommendationContext(preferences, products),
   };
 }
 
@@ -143,6 +174,7 @@ function analyzePreferences(text) {
     proteinIntent,
     type: match(['рідк', 'жидк']) ? 'liquid' : match(['сух', 'суход']) ? 'dry' : null,
     color: match(['жовт', 'золот', 'желт']) ? 'yellow' : match(['червон', 'красн']) ? 'red' : match(['зелен', 'зелён']) ? 'green' : null,
+    unsupportedColor: match(['чорн', 'черн']) ? 'black' : null,
     flavors: [],
     sweetness: null,
     spiciness: null,
@@ -178,6 +210,117 @@ function analyzePreferences(text) {
   else if (match(['гостр', 'остр'])) preferences.spiciness = 4;
 
   return preferences;
+}
+
+function emptyPreferences() {
+  return {
+    meat: null,
+    proteinIntent: null,
+    type: null,
+    color: null,
+    unsupportedColor: null,
+    flavors: [],
+    sweetness: null,
+    spiciness: null,
+  };
+}
+
+function mergeConversationPreferences(history, message) {
+  const preferences = emptyPreferences();
+  const userMessages = [
+    ...history.filter((item) => item.role === 'user').map((item) => item.content),
+    message,
+  ];
+
+  userMessages.forEach((content) => {
+    const next = analyzePreferences(content);
+    if (next.proteinIntent) {
+      preferences.proteinIntent = next.proteinIntent;
+      preferences.meat = next.meat;
+    }
+    if (next.type) preferences.type = next.type;
+    if (next.color) {
+      preferences.color = next.color;
+      preferences.unsupportedColor = null;
+    } else if (next.unsupportedColor) {
+      preferences.color = null;
+      preferences.unsupportedColor = next.unsupportedColor;
+    }
+    if (next.flavors.length) preferences.flavors = [...new Set([...preferences.flavors, ...next.flavors])];
+    if (next.sweetness !== null) preferences.sweetness = next.sweetness;
+    if (next.spiciness !== null) preferences.spiciness = next.spiciness;
+  });
+
+  return preferences;
+}
+
+function sanitizeLastRecommendation(value) {
+  if (!value || typeof value !== 'object') return null;
+  const intent = getProteinIntentById(value.requestedProtein);
+  if (!intent || !['exact', 'compatible'].includes(value.matchType)) return null;
+
+  const productIds = Array.isArray(value.productIds)
+    ? value.productIds.filter((id) => typeof id === 'string' && catalogById.has(id)).slice(0, 3)
+    : [];
+  if (!productIds.length) return null;
+
+  const catalogProtein = catalogById.get(productIds[0])?.meat;
+  if (!catalogProtein || catalogProtein !== intent.catalogMeat) return null;
+
+  return {
+    requestedProtein: intent.protein,
+    requestedProteinLabel: intent.proteinLabel,
+    requestedProteinGenitive: intent.proteinGenitive,
+    catalogProtein,
+    matchType: intent.isExactCatalogProtein ? 'exact' : 'compatible',
+    proteinGroup: intent.proteinGroup,
+    proteinGroupLabel: intent.proteinGroupLabel,
+    compatibilityReason: intent.isExactCatalogProtein
+      ? `Товар належить до запитаної категорії «${intent.proteinGroupLabel}».`
+      : `У каталозі немає окремої категорії для ${intent.proteinGenitive}, тому використано сумісну категорію «${intent.proteinGroupLabel}».`,
+    productIds,
+    parameters: value.parameters && typeof value.parameters === 'object' ? {
+      type: ['dry', 'liquid'].includes(value.parameters.type) ? value.parameters.type : null,
+      color: ['yellow', 'red', 'green'].includes(value.parameters.color) ? value.parameters.color : null,
+    } : { type: null, color: null },
+  };
+}
+
+function isQuestionAboutLastRecommendation(text, lastRecommendation) {
+  if (!lastRecommendation) return false;
+  const normalized = text.toLocaleLowerCase('uk-UA').replace(/[’']/g, '');
+  if (includesAny(normalized, ['покажи інший', 'покажіть інший', 'підбери інший', 'порадь інший', 'другой вариант', 'покажи другой'])) {
+    return false;
+  }
+
+  return includesAny(normalized, [
+    'тут вказано', 'тут написано', 'на картці', 'в карточке', 'но тут', 'але тут',
+    'чому для', 'почему для', 'це ж для', 'это же для', 'але він для', 'но он для',
+    'але це для', 'но это для', 'хіба це', 'разве это',
+    'підійде', 'підходить', 'подойдет', 'почему вы рекомендовали', 'чому ви порадили',
+  ]);
+}
+
+function explainLastRecommendation(lastRecommendation) {
+  const intent = getProteinIntentById(lastRecommendation.requestedProtein);
+  if (!intent) return '';
+  if (lastRecommendation.matchType === 'exact') {
+    return `Так, у картці вказана загальна категорія «${intent.proteinGroupLabel}». ${intent.proteinLabel} належить до неї, тому рекомендація відповідає вашому запиту.`;
+  }
+  if (intent.proteinGroup === 'poultry') {
+    return `Так, у картці вказано «Курка». Я порадив цей маринад як сумісний варіант для ${intent.proteinGenitive}: обидва продукти належать до птиці, а окремої категорії для ${intent.proteinGenitive} в каталозі немає.`;
+  }
+  return `Так, у картці вказано «Свинина». Я порадив цей маринад як сумісний варіант для ${intent.proteinGenitive}: обидва продукти належать до червоного м’яса, а окремої категорії для ${intent.proteinGenitive} в каталозі немає.`;
+}
+
+function unsupportedColorResponse(preferences) {
+  return {
+    message: 'Чорних маринадів у каталозі немає.',
+    question: 'Який колір оберете: червоний, жовтий чи зелений?',
+    products: [],
+    source: 'local',
+    recommendationContext: null,
+  };
 }
 
 function compatibilityExplanation(intent) {
@@ -235,10 +378,11 @@ function buildCompatibilityContext(preferences) {
   return `Серверний аналіз продукту: requestedProtein=${intent.protein}; proteinGroup=${intent.proteinGroup}; catalogMeat=${intent.catalogMeat}; exactCatalogProtein=${intent.isExactCatalogProtein}. ${intent.isExactCatalogProtein ? 'Це точна категорія каталогу.' : 'Це сумісна заміна: обов’язково поясни її користувачу й не відмовляй у підборі.'}`;
 }
 
-function localFallback(message, history) {
-  const conversationText = [...history.filter((item) => item.role === 'user').map((item) => item.content), message].join(' ');
-  const preferences = analyzePreferences(conversationText);
+function localFallback(message, history, preparedPreferences = null) {
+  const preferences = preparedPreferences || mergeConversationPreferences(history, message);
   const hasUsefulDetail = hasUsefulPreferences(preferences);
+
+  if (preferences.unsupportedColor) return unsupportedColorResponse(preferences);
 
   if (!preferences.meat) {
     return toBrowserResponse({
@@ -261,7 +405,7 @@ function localFallback(message, history) {
   const scored = rankProducts(preferences);
 
   return toBrowserResponse({
-    message: 'Groq тимчасово недоступний. Ось найближчі варіанти за локальним підбором:',
+    message: 'За вашим запитом підійдуть такі маринади:',
     needsClarification: false,
     question: null,
     productIds: scored.map(({ id }) => id),
@@ -277,8 +421,7 @@ export default async function handler(request, response) {
   const body = typeof request.body === 'string' ? parseBody(request.body) : request.body;
   const message = typeof body?.message === 'string' ? body.message.trim() : '';
   const history = safeHistory(body?.history);
-  const conversationText = [...history.filter((item) => item.role === 'user').map((item) => item.content), message].join(' ');
-  const preferences = analyzePreferences(conversationText);
+  const lastRecommendation = sanitizeLastRecommendation(body?.lastRecommendation);
 
   if (!message || message.length > MAX_MESSAGE_LENGTH) {
     return sendJson(response, 400, {
@@ -287,8 +430,23 @@ export default async function handler(request, response) {
     });
   }
 
+  if (isQuestionAboutLastRecommendation(message, lastRecommendation)) {
+    return sendJson(response, 200, {
+      message: explainLastRecommendation(lastRecommendation),
+      question: null,
+      products: [],
+      source: 'local-context',
+      recommendationContext: lastRecommendation,
+    });
+  }
+
+  const preferences = mergeConversationPreferences(history, message);
+  if (preferences.unsupportedColor) {
+    return sendJson(response, 200, unsupportedColorResponse(preferences));
+  }
+
   if (!process.env.GROQ_API_KEY) {
-    return sendJson(response, 200, localFallback(message, history));
+    return sendJson(response, 200, localFallback(message, history, preferences));
   }
 
   try {
@@ -329,13 +487,13 @@ export default async function handler(request, response) {
     const safeResult = toBrowserResponse(parsed, 'groq', preferences);
 
     if (!safeResult.products.length && !parsed.needsClarification) {
-      return sendJson(response, 200, localFallback(message, history));
+      return sendJson(response, 200, localFallback(message, history, preferences));
     }
 
     return sendJson(response, 200, safeResult);
   } catch (error) {
     console.error('Groq assistant request failed:', error instanceof Error ? error.message : 'Unknown error');
-    return sendJson(response, 200, localFallback(message, history));
+    return sendJson(response, 200, localFallback(message, history, preferences));
   }
 }
 
@@ -354,6 +512,9 @@ export const __testables = {
   hasUsefulPreferences,
   localFallback,
   mapValidatedProducts,
+  mergeConversationPreferences,
   rankProducts,
+  sanitizeLastRecommendation,
+  isQuestionAboutLastRecommendation,
   toBrowserResponse,
 };

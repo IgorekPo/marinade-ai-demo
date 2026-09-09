@@ -89,7 +89,31 @@ function capitalize(value) {
 }
 
 function emptyChatSession() {
-  return { transcript: [], history: [] };
+  return { transcript: [], history: [], lastRecommendation: null };
+}
+
+function sanitizeLastRecommendation(value) {
+  if (!value || typeof value !== 'object') return null;
+  const productIds = Array.isArray(value.productIds)
+    ? value.productIds.filter((id) => typeof id === 'string' && catalogById.has(id)).slice(0, 3)
+    : [];
+  if (!productIds.length || !['exact', 'compatible'].includes(value.matchType)) return null;
+
+  return {
+    requestedProtein: String(value.requestedProtein || '').slice(0, 50),
+    requestedProteinLabel: String(value.requestedProteinLabel || '').slice(0, 100),
+    requestedProteinGenitive: String(value.requestedProteinGenitive || '').slice(0, 100),
+    catalogProtein: String(value.catalogProtein || '').slice(0, 50),
+    matchType: value.matchType,
+    proteinGroup: String(value.proteinGroup || '').slice(0, 50),
+    proteinGroupLabel: String(value.proteinGroupLabel || '').slice(0, 100),
+    compatibilityReason: String(value.compatibilityReason || '').slice(0, 500),
+    productIds,
+    parameters: {
+      type: ['dry', 'liquid'].includes(value.parameters?.type) ? value.parameters.type : null,
+      color: ['yellow', 'red', 'green'].includes(value.parameters?.color) ? value.parameters.color : null,
+    },
+  };
 }
 
 function sanitizeChatSession(value) {
@@ -115,7 +139,7 @@ function sanitizeChatSession(value) {
     .filter((entry) => entry && ['user', 'assistant'].includes(entry.role) && typeof entry.content === 'string')
     .map((entry) => ({ role: entry.role, content: entry.content.slice(0, 1500) }));
 
-  return { transcript, history };
+  return { transcript, history, lastRecommendation: sanitizeLastRecommendation(value.lastRecommendation) };
 }
 
 function loadChatSession(storage) {
@@ -198,7 +222,11 @@ export function initChat() {
       const response = await fetch('/api/assistant', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: userMessage, history: requestHistory }),
+        body: JSON.stringify({
+          message: userMessage,
+          history: requestHistory,
+          lastRecommendation: chatSession.lastRecommendation,
+        }),
       });
 
       const data = await response.json().catch(() => null);
@@ -218,6 +246,8 @@ export function initChat() {
       });
 
       const productIds = validProducts.map((product) => product.id);
+      const recommendationContext = sanitizeLastRecommendation(data.recommendationContext);
+      if (recommendationContext) chatSession.lastRecommendation = recommendationContext;
       const assistantContext = productIds.length
         ? `${assistantText}\nРекомендовані productIds: ${productIds.join(', ')}`
         : assistantText;
@@ -254,6 +284,7 @@ export function initChat() {
 export const __testables = {
   CHAT_STORAGE_KEY,
   emptyChatSession,
+  sanitizeLastRecommendation,
   sanitizeChatSession,
   loadChatSession,
   saveChatSession,

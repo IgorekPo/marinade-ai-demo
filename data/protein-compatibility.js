@@ -54,9 +54,28 @@ export function resolveProteinIntent(text) {
           proteinGroup: groupId,
           proteinGroupLabel: group.label,
           catalogMeat: group.catalogMeat,
-          isExactCatalogProtein: protein.id === group.catalogMeat,
+          isExactCatalogProtein: protein.id === group.catalogMeat || groupId === 'fish',
         };
       }
+    }
+  }
+
+  return null;
+}
+
+export function getProteinIntentById(proteinId) {
+  for (const [groupId, group] of Object.entries(proteinGroups)) {
+    const protein = group.proteins.find(({ id }) => id === proteinId);
+    if (protein) {
+      return {
+        protein: protein.id,
+        proteinLabel: protein.label,
+        proteinGenitive: protein.genitive,
+        proteinGroup: groupId,
+        proteinGroupLabel: group.label,
+        catalogMeat: group.catalogMeat,
+        isExactCatalogProtein: protein.id === group.catalogMeat || groupId === 'fish',
+      };
     }
   }
 
