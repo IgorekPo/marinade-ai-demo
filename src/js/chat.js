@@ -97,7 +97,7 @@ function sanitizeLastRecommendation(value) {
   const productIds = Array.isArray(value.productIds)
     ? value.productIds.filter((id) => typeof id === 'string' && catalogById.has(id)).slice(0, 3)
     : [];
-  if (!productIds.length || !['exact', 'compatible'].includes(value.matchType)) return null;
+  if (!productIds.length || !['exact', 'compatible', 'different-protein'].includes(value.matchType)) return null;
 
   return {
     requestedProtein: String(value.requestedProtein || '').slice(0, 50),
@@ -105,9 +105,18 @@ function sanitizeLastRecommendation(value) {
     requestedProteinGenitive: String(value.requestedProteinGenitive || '').slice(0, 100),
     catalogProtein: String(value.catalogProtein || '').slice(0, 50),
     matchType: value.matchType,
+    matchLevel: ['EXACT', 'COMPATIBLE', 'TASTE_ALTERNATIVE', 'NEAR_TASTE', 'OTHER'].includes(value.matchLevel)
+      ? value.matchLevel
+      : 'OTHER',
     proteinGroup: String(value.proteinGroup || '').slice(0, 50),
     proteinGroupLabel: String(value.proteinGroupLabel || '').slice(0, 100),
     compatibilityReason: String(value.compatibilityReason || '').slice(0, 500),
+    requestedTasteDirection: String(value.requestedTasteDirection || '').slice(0, 50) || null,
+    requestedTasteProfile: String(value.requestedTasteProfile || '').slice(0, 50) || null,
+    catalogTasteDirection: String(value.catalogTasteDirection || '').slice(0, 50) || null,
+    catalogTasteProfiles: Array.isArray(value.catalogTasteProfiles)
+      ? value.catalogTasteProfiles.filter((profile) => typeof profile === 'string').slice(0, 8)
+      : [],
     productIds,
     parameters: {
       type: ['dry', 'liquid'].includes(value.parameters?.type) ? value.parameters.type : null,

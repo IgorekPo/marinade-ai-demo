@@ -6,6 +6,12 @@ import {
   proteinGroupsForPrompt,
   resolveProteinIntent,
 } from '../data/protein-compatibility.js';
+import {
+  getTasteIntent,
+  productTasteMatch,
+  resolveTasteIntent,
+  tasteTaxonomyForPrompt,
+} from '../data/taste-compatibility.js';
 
 const catalogById = new Map(marinades.map((product) => [product.id, product]));
 const MAX_MESSAGE_LENGTH = 1500;
@@ -17,7 +23,8 @@ const compactCatalog = marinades.map((product) => ({
   type: product.type,
   protein: product.meat,
   color: product.color,
-  tastes: product.flavors,
+  tasteDirection: product.tasteDirection,
+  tasteProfiles: product.tasteProfiles,
   spicy: product.spiciness,
   sweet: product.sweetness,
 }));
@@ -67,10 +74,18 @@ const systemInstruction = `# Роль
 - Зберігай уже названі параметри запиту між репліками. Нове значення того самого параметра замінює попереднє: наприклад, «червоний» після «чорний» означає актуальний червоний колір, а тип і продукт зберігаються.
 - Якщо користувач запитує, чому в рекомендованій картці вказано інший продукт, поясни попередню сумісну рекомендацію. Не сприймай назву продукту з такого питання як новий запит і не запускай новий підбір, якщо користувач прямо не просить інший варіант.
 - У поясненні сумісності чітко розрізняй requestedProtein користувача, catalogProtein картки та matchType. Не називай сумісну рекомендацію точним збігом.
+- Розрізняй загальний смаковий напрямок і конкретний смаковий профіль. «Фруктовий» означає всі товари напрямку fruit, а «вишневий» — насамперед профіль cherry.
+- Використовуй тільки tasteDirection і tasteProfiles, які є в контрольованій taxonomy та компактному каталозі. Не вигадуй відсутні смаки.
+- Порядок підбору: точний продукт + потрібний смак; сумісна білкова категорія + потрібний смак; інший продукт + потрібний смак із чесним поясненням; сумісний продукт + близький смак із чесним поясненням.
+- Якщо товар має інший фактичний protein, не стверджуй, що він точно підходить до запитаного продукту. Назви фактичне призначення картки та поясни, що це альтернатива саме за смаковим профілем.
 
 # Контрольовані групи сумісності
 
 ${JSON.stringify(proteinGroupsForPrompt)}
+
+# Контрольована taxonomy смаків
+
+${JSON.stringify(tasteTaxonomyForPrompt)}
 
 # Каталог
 
@@ -116,26 +131,52 @@ function mapValidatedProducts(productIds) {
         meat: product.meat,
         color: product.color,
         flavors: product.flavors,
-        reason: product.description,
+        reason: product.whySuitable || product.description,
       };
     });
+}
+
+function proteinMatchType(product, intent) {
+  if (!intent) return 'different-protein';
+  if (product.meat === intent.protein || (intent.isExactCatalogProtein && product.meat === intent.catalogMeat)) {
+    return 'exact';
+  }
+  if (product.meat === intent.catalogMeat) return 'compatible';
+  return 'different-protein';
+}
+
+function classifyProductMatch(product, preferences) {
+  const proteinMatch = proteinMatchType(product, preferences.proteinIntent);
+  const tasteMatch = productTasteMatch(product, preferences.tasteIntent);
+  let matchLevel = 'OTHER';
+  if (tasteMatch.exact && proteinMatch === 'exact') matchLevel = 'EXACT';
+  else if (tasteMatch.exact && proteinMatch === 'compatible') matchLevel = 'COMPATIBLE';
+  else if (tasteMatch.exact) matchLevel = 'TASTE_ALTERNATIVE';
+  else if (tasteMatch.near && proteinMatch !== 'different-protein') matchLevel = 'NEAR_TASTE';
+  return { proteinMatch, tasteMatch, matchLevel };
 }
 
 function createRecommendationContext(preferences, products) {
   const intent = preferences?.proteinIntent;
   if (!intent || !products.length) return null;
+  const catalogProduct = catalogById.get(products[0].id);
+  const match = classifyProductMatch(catalogProduct, preferences);
 
   return {
     requestedProtein: intent.protein,
     requestedProteinLabel: intent.proteinLabel,
     requestedProteinGenitive: intent.proteinGenitive,
     catalogProtein: products[0].meat,
-    matchType: intent.isExactCatalogProtein ? 'exact' : 'compatible',
+    matchType: match.proteinMatch,
+    matchLevel: match.matchLevel,
     proteinGroup: intent.proteinGroup,
     proteinGroupLabel: intent.proteinGroupLabel,
-    compatibilityReason: intent.isExactCatalogProtein
-      ? `Товар належить до запитаної категорії «${intent.proteinGroupLabel}».`
-      : `У каталозі немає окремої категорії для ${intent.proteinGenitive}, тому використано сумісну категорію «${intent.proteinGroupLabel}».`,
+    compatibilityReason: recommendationExplanation(preferences, products)
+      || `Товар належить до запитаної категорії «${intent.proteinGroupLabel}».`,
+    requestedTasteDirection: preferences.tasteIntent?.direction || null,
+    requestedTasteProfile: preferences.tasteIntent?.profile || null,
+    catalogTasteDirection: catalogProduct.tasteDirection,
+    catalogTasteProfiles: catalogProduct.tasteProfiles,
     productIds: products.map((product) => product.id),
     parameters: {
       type: preferences.type,
@@ -158,10 +199,8 @@ function toBrowserResponse(result, source = 'groq', preferences = null) {
   const products = result.needsClarification
     ? []
     : mapValidatedProducts(rankedIds?.length ? rankedIds : result.productIds);
-  const explanation = compatibilityExplanation(preferences?.proteinIntent);
-  const message = explanation
-    ? source === 'fallback' ? `${result.message.trim()} ${explanation}` : explanation
-    : result.message.trim();
+  const explanation = recommendationExplanation(preferences, products);
+  const message = explanation || result.message.trim();
 
   return {
     message,
@@ -176,12 +215,14 @@ function includesAny(text, fragments) {
 }
 
 function analyzePreferences(text) {
-  const normalized = text.toLocaleLowerCase('uk-UA').replace(/[’']/g, '');
+  const normalized = text.toLocaleLowerCase('uk-UA').replace(/ё/g, 'е').replace(/[’']/g, '');
   const match = (fragments) => includesAny(normalized, fragments);
   const proteinIntent = resolveProteinIntent(normalized);
+  const tasteIntent = resolveTasteIntent(normalized);
   const preferences = {
     meat: proteinIntent?.catalogMeat || null,
     proteinIntent,
+    tasteIntent,
     type: match(['рідк', 'жидк']) ? 'liquid' : match(['сух', 'суход']) ? 'dry' : null,
     color: match(['жовт', 'золот', 'желт']) ? 'yellow' : match(['червон', 'красн']) ? 'red' : match(['зелен', 'зелён']) ? 'green' : null,
     unsupportedColor: match(['чорн', 'черн']) ? 'black' : null,
@@ -226,6 +267,7 @@ function emptyPreferences() {
   return {
     meat: null,
     proteinIntent: null,
+    tasteIntent: null,
     type: null,
     color: null,
     unsupportedColor: null,
@@ -243,6 +285,10 @@ function preferencesFromLastRecommendation(lastRecommendation) {
   return {
     meat: intent.catalogMeat,
     proteinIntent: intent,
+    tasteIntent: getTasteIntent(
+      lastRecommendation.requestedTasteDirection,
+      lastRecommendation.requestedTasteProfile,
+    ),
     type: lastRecommendation.parameters?.type || null,
     color: lastRecommendation.parameters?.color || null,
     unsupportedColor: null,
@@ -278,6 +324,7 @@ function mergeConversationPreferences(history, message, lastRecommendation = nul
       preferences.proteinIntent = next.proteinIntent;
       preferences.meat = next.meat;
     }
+    if (next.tasteIntent) preferences.tasteIntent = next.tasteIntent;
     if (next.type) preferences.type = next.type;
     if (next.color) {
       preferences.color = next.color;
@@ -297,37 +344,42 @@ function mergeConversationPreferences(history, message, lastRecommendation = nul
 function sanitizeLastRecommendation(value) {
   if (!value || typeof value !== 'object') return null;
   const intent = getProteinIntentById(value.requestedProtein);
-  if (!intent || !['exact', 'compatible'].includes(value.matchType)) return null;
+  if (!intent) return null;
 
   const productIds = Array.isArray(value.productIds)
     ? value.productIds.filter((id) => typeof id === 'string' && catalogById.has(id)).slice(0, 3)
     : [];
   if (!productIds.length) return null;
 
-  const catalogProtein = catalogById.get(productIds[0])?.meat;
-  if (!catalogProtein || catalogProtein !== intent.catalogMeat) return null;
+  const catalogProduct = catalogById.get(productIds[0]);
+  const parameters = value.parameters && typeof value.parameters === 'object' ? {
+    type: ['dry', 'liquid'].includes(value.parameters.type) ? value.parameters.type : null,
+    color: ['yellow', 'red', 'green'].includes(value.parameters.color) ? value.parameters.color : null,
+    flavors: Array.isArray(value.parameters.flavors)
+      ? value.parameters.flavors.filter((flavor) => typeof flavor === 'string').slice(0, 8)
+      : [],
+    sweetness: Number.isFinite(value.parameters.sweetness) ? value.parameters.sweetness : null,
+    spiciness: Number.isFinite(value.parameters.spiciness) ? value.parameters.spiciness : null,
+  } : { type: null, color: null, flavors: [], sweetness: null, spiciness: null };
+  const tasteIntent = getTasteIntent(value.requestedTasteDirection, value.requestedTasteProfile);
+  const match = classifyProductMatch(catalogProduct, { proteinIntent: intent, tasteIntent });
 
   return {
     requestedProtein: intent.protein,
     requestedProteinLabel: intent.proteinLabel,
     requestedProteinGenitive: intent.proteinGenitive,
-    catalogProtein,
-    matchType: intent.isExactCatalogProtein ? 'exact' : 'compatible',
+    catalogProtein: catalogProduct.meat,
+    matchType: match.proteinMatch,
+    matchLevel: match.matchLevel,
     proteinGroup: intent.proteinGroup,
     proteinGroupLabel: intent.proteinGroupLabel,
-    compatibilityReason: intent.isExactCatalogProtein
-      ? `Товар належить до запитаної категорії «${intent.proteinGroupLabel}».`
-      : `У каталозі немає окремої категорії для ${intent.proteinGenitive}, тому використано сумісну категорію «${intent.proteinGroupLabel}».`,
+    compatibilityReason: String(value.compatibilityReason || '').slice(0, 500),
+    requestedTasteDirection: tasteIntent?.direction || null,
+    requestedTasteProfile: tasteIntent?.profile || null,
+    catalogTasteDirection: catalogProduct.tasteDirection,
+    catalogTasteProfiles: catalogProduct.tasteProfiles,
     productIds,
-    parameters: value.parameters && typeof value.parameters === 'object' ? {
-      type: ['dry', 'liquid'].includes(value.parameters.type) ? value.parameters.type : null,
-      color: ['yellow', 'red', 'green'].includes(value.parameters.color) ? value.parameters.color : null,
-      flavors: Array.isArray(value.parameters.flavors)
-        ? value.parameters.flavors.filter((flavor) => typeof flavor === 'string').slice(0, 8)
-        : [],
-      sweetness: Number.isFinite(value.parameters.sweetness) ? value.parameters.sweetness : null,
-      spiciness: Number.isFinite(value.parameters.spiciness) ? value.parameters.spiciness : null,
-    } : { type: null, color: null, flavors: [], sweetness: null, spiciness: null },
+    parameters,
   };
 }
 
@@ -357,11 +409,23 @@ function isAlternativeRequest(text) {
 function explainLastRecommendation(lastRecommendation) {
   const intent = getProteinIntentById(lastRecommendation.requestedProtein);
   if (!intent) return '';
+  const tasteIntent = getTasteIntent(
+    lastRecommendation.requestedTasteDirection,
+    lastRecommendation.requestedTasteProfile,
+  );
+  const tasteSuffix = tasteIntent
+    ? ` з потрібним вам ${tasteIntent.profile ? `смаком «${tasteIntent.profileLabel}»` : `смаковим напрямком «${tasteIntent.directionLabel}»`}`
+    : '';
   if (lastRecommendation.matchType === 'exact') {
     return `Так, у картці вказана загальна категорія «${intent.proteinGroupLabel}». ${intent.proteinLabel} належить до неї, тому рекомендація відповідає вашому запиту.`;
   }
+  if (lastRecommendation.matchType === 'different-protein') {
+    const meatLabels = { chicken: 'курки', pork: 'свинини', fish: 'риби' };
+    const taste = catalogById.get(lastRecommendation.productIds[0])?.flavors[0] || 'потрібним профілем';
+    return `Так, ви праві. Це маринад для ${meatLabels[lastRecommendation.catalogProtein]}. Для ${intent.proteinGenitive} потрібного смакового варіанта в каталозі немає, тому я запропонував його лише як найближчу альтернативу за смаком «${taste}», а не як точний збіг за продуктом.`;
+  }
   if (intent.proteinGroup === 'poultry') {
-    return `Так, у картці вказано «Курка». Я порадив цей маринад як сумісний варіант для ${intent.proteinGenitive}: обидва продукти належать до птиці, а окремої категорії для ${intent.proteinGenitive} в каталозі немає.`;
+    return `Так, ви праві. У картці вказано «Курка», тому що це фактичне призначення товару. Окремого варіанта для ${intent.proteinGenitive} в каталозі немає, тому я запропонував його як найближчий сумісний для птиці${tasteSuffix}.`;
   }
   return `Так, у картці вказано «Свинина». Я порадив цей маринад як сумісний варіант для ${intent.proteinGenitive}: обидва продукти належать до червоного м’яса, а окремої категорії для ${intent.proteinGenitive} в каталозі немає.`;
 }
@@ -387,8 +451,42 @@ function compatibilityExplanation(intent) {
   return `Окремих маринадів для ${intent.proteinGenitive} в каталозі немає, але це риба, тому пропоную найближчі сумісні варіанти з категорії рибних маринадів:`;
 }
 
+function requestedTasteText(tasteIntent) {
+  if (!tasteIntent) return '';
+  return tasteIntent.profile
+    ? `зі смаком «${tasteIntent.profileLabel}»`
+    : `смакового напрямку «${tasteIntent.directionLabel}»`;
+}
+
+function recommendationExplanation(preferences, products) {
+  if (!preferences?.proteinIntent || !products.length) return '';
+  if (!preferences.tasteIntent) return compatibilityExplanation(preferences.proteinIntent);
+
+  const product = catalogById.get(products[0].id);
+  const match = classifyProductMatch(product, preferences);
+  const tasteText = requestedTasteText(preferences.tasteIntent);
+  const productTaste = product.flavors[0];
+  const meatLabels = { chicken: 'курки', pork: 'свинини', fish: 'риби' };
+
+  if (match.matchLevel === 'EXACT') {
+    return 'За вашим запитом можу запропонувати такі варіанти:';
+  }
+  if (match.matchLevel === 'COMPATIBLE') {
+    return `Окремого маринаду ${tasteText} для ${preferences.proteinIntent.proteinGenitive} в каталозі немає, але цей продукт належить до групи «${preferences.proteinIntent.proteinGroupLabel}». Пропоную найближчий сумісний варіант для ${meatLabels[product.meat]} з потрібним смаковим профілем:`;
+  }
+  if (match.matchLevel === 'TASTE_ALTERNATIVE') {
+    return `Для ${preferences.proteinIntent.proteinGenitive} маринаду ${tasteText} в каталозі немає. Це маринад для ${meatLabels[product.meat]}, але він найближчий до вашого запиту саме за потрібним смаковим профілем:`;
+  }
+  if (match.matchLevel === 'NEAR_TASTE') {
+    return `Точного варіанта ${tasteText} для ${preferences.proteinIntent.proteinGenitive} немає. Найближчий доступний смак — «${productTaste}», тому пропоную його як смакову альтернативу:`;
+  }
+  return '';
+}
+
 function rankProducts(preferences) {
-  let candidates = marinades.filter((product) => productProteinScore(product, preferences.proteinIntent) > 0);
+  let candidates = preferences.tasteIntent
+    ? [...marinades]
+    : marinades.filter((product) => productProteinScore(product, preferences.proteinIntent) > 0);
   if (!candidates.length) candidates = [...marinades];
 
   const excludedIds = new Set(preferences.excludedProductIds || []);
@@ -396,32 +494,40 @@ function rankProducts(preferences) {
     candidates = candidates.filter((product) => !excludedIds.has(product.id));
   }
 
-  if (preferences.type && candidates.some((product) => product.type === preferences.type)) {
-    candidates = candidates.filter((product) => product.type === preferences.type);
-  }
-  if (preferences.color && candidates.some((product) => product.color === preferences.color)) {
-    candidates = candidates.filter((product) => product.color === preferences.color);
-  }
-
-  return candidates
+  const levelScores = {
+    EXACT: 500,
+    COMPATIBLE: 400,
+    TASTE_ALTERNATIVE: 300,
+    NEAR_TASTE: 200,
+    OTHER: 0,
+  };
+  const ranked = candidates
     .map((product, index) => {
+      const match = classifyProductMatch(product, preferences);
       let score = productProteinScore(product, preferences.proteinIntent);
+      if (preferences.tasteIntent) score += levelScores[match.matchLevel];
       if (preferences.type) score += product.type === preferences.type ? 32 : -32;
       if (preferences.color) score += product.color === preferences.color ? 26 : -26;
       const productFlavors = product.flavors.join(' ').toLocaleLowerCase('uk-UA');
       score += preferences.flavors.filter((flavor) => productFlavors.includes(flavor)).length * 7;
       if (preferences.spiciness !== null) score += 6 - Math.abs(product.spiciness - preferences.spiciness);
       if (preferences.sweetness !== null) score += 6 - Math.abs(product.sweetness - preferences.sweetness);
-      return { id: product.id, score, index };
+      if (match.tasteMatch.exactProfile) score += 24;
+      if (preferences.tasteIntent && product.tasteDirection === preferences.tasteIntent.direction) score += 40;
+      return { id: product.id, score, index, matchLevel: match.matchLevel };
     })
-    .sort((a, b) => b.score - a.score || a.index - b.index)
-    .slice(0, 3);
+    .sort((a, b) => b.score - a.score || a.index - b.index);
+
+  if (!preferences.tasteIntent || !ranked.length) return ranked.slice(0, 3);
+  const bestLevel = ranked[0].matchLevel;
+  return ranked.filter((product) => product.matchLevel === bestLevel).slice(0, 3);
 }
 
 function hasUsefulPreferences(preferences) {
   return Boolean(
     preferences.type
     || preferences.color
+    || preferences.tasteIntent
     || preferences.flavors.length
     || preferences.sweetness !== null
     || preferences.spiciness !== null,
@@ -435,6 +541,8 @@ function buildCompatibilityContext(preferences, lastRecommendation = null) {
     catalogProtein: intent?.catalogMeat || null,
     proteinGroup: intent?.proteinGroup || null,
     matchType: intent ? (intent.isExactCatalogProtein ? 'exact' : 'compatible') : null,
+    requestedTasteDirection: preferences.tasteIntent?.direction || null,
+    requestedTasteProfile: preferences.tasteIntent?.profile || null,
     preferences: {
       type: preferences.type,
       color: preferences.color,
@@ -447,6 +555,9 @@ function buildCompatibilityContext(preferences, lastRecommendation = null) {
       requestedProtein: lastRecommendation.requestedProtein,
       catalogProtein: lastRecommendation.catalogProtein,
       matchType: lastRecommendation.matchType,
+      matchLevel: lastRecommendation.matchLevel,
+      requestedTasteDirection: lastRecommendation.requestedTasteDirection,
+      requestedTasteProfile: lastRecommendation.requestedTasteProfile,
     } : null,
   };
 
@@ -547,6 +658,9 @@ export default async function handler(request, response) {
   }
   if (preferences.unsupportedColor) {
     return sendJson(response, 200, unsupportedColorResponse(preferences));
+  }
+  if (!preferences.meat) {
+    return sendJson(response, 200, localFallback(message, history, preferences));
   }
 
   if (!process.env.GROQ_API_KEY) {

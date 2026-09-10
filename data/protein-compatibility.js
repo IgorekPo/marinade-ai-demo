@@ -4,7 +4,7 @@ export const proteinGroups = {
     catalogMeat: 'chicken',
     proteins: [
       { id: 'chicken', label: 'курка', genitive: 'курки', aliases: ['курк', 'куряч', 'куриц', 'цыпл'] },
-      { id: 'turkey', label: 'індичка', genitive: 'індички', aliases: ['індич', 'индич', 'индей', 'индюш'] },
+      { id: 'turkey', label: 'індичка', genitive: 'індички', aliases: ['індич', 'индич', 'индей', 'индюш', 'индюк'] },
       { id: 'duck', label: 'качка', genitive: 'качки', aliases: ['качк', 'утк'] },
       { id: 'goose', label: 'гуска', genitive: 'гуски', aliases: ['гуск', 'гусин'] },
       { id: 'quail', label: 'перепілка', genitive: 'перепілки', aliases: ['перепіл', 'перепел'] },
