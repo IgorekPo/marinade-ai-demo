@@ -78,6 +78,13 @@ const systemInstruction = `# Роль
 - Використовуй тільки tasteDirection і tasteProfiles, які є в контрольованій taxonomy та компактному каталозі. Не вигадуй відсутні смаки.
 - Порядок підбору: точний продукт + потрібний смак; сумісна білкова категорія + потрібний смак; інший продукт + потрібний смак із чесним поясненням; сумісний продукт + близький смак із чесним поясненням.
 - Якщо товар має інший фактичний protein, не стверджуй, що він точно підходить до запитаного продукту. Назви фактичне призначення картки та поясни, що це альтернатива саме за смаковим профілем.
+- Аналізуй сенс усього повідомлення, а не реагуй на окреме слово. Пріоритет намірів: конкретний запит про товар; питання про попередню рекомендацію; зміна параметрів; скарга з конкретним запитом; подяка з конкретним запитом; чиста скарга; чиста подяка; невимушена розмова.
+- Якщо користувач лише дякує або завершує розмову, коротко й природно відповідай без пошуку та без productIds.
+- Подяка не скасовує запит у тому самому повідомленні. Якщо разом із нею є новий параметр, питання або прохання показати інший варіант, виконай цей запит із збереженням контексту.
+- На роздратування чи грубість відповідай спокійно, без суперечки, повчань, пасивної агресії та згадок про правила поведінки.
+- Якщо негативне повідомлення містить конкретний запит, насамперед виконай його; для деескалації можна додати не більше одного короткого речення.
+- Якщо користувач лише незадоволений і не дав конкретного запиту, постав одне найдоречніше уточнення на основі поточного контексту.
+- Якщо скарга стосується попередньої рекомендації, поясни саме її та не запускай новий підбір.
 
 # Контрольовані групи сумісності
 
@@ -214,8 +221,12 @@ function includesAny(text, fragments) {
   return fragments.some((fragment) => text.includes(fragment));
 }
 
+function normalizeMessage(text) {
+  return text.toLocaleLowerCase('uk-UA').replace(/ё/g, 'е').replace(/[’']/g, '').replace(/\s+/g, ' ').trim();
+}
+
 function analyzePreferences(text) {
-  const normalized = text.toLocaleLowerCase('uk-UA').replace(/ё/g, 'е').replace(/[’']/g, '');
+  const normalized = normalizeMessage(text);
   const match = (fragments) => includesAny(normalized, fragments);
   const proteinIntent = resolveProteinIntent(normalized);
   const tasteIntent = resolveTasteIntent(normalized);
@@ -385,13 +396,14 @@ function sanitizeLastRecommendation(value) {
 
 function isQuestionAboutLastRecommendation(text, lastRecommendation) {
   if (!lastRecommendation) return false;
-  const normalized = text.toLocaleLowerCase('uk-UA').replace(/[’']/g, '');
+  const normalized = normalizeMessage(text);
   if (includesAny(normalized, ['покажи інший', 'покажіть інший', 'підбери інший', 'порадь інший', 'другой вариант', 'покажи другой'])) {
     return false;
   }
 
   return includesAny(normalized, [
-    'тут вказано', 'тут написано', 'на картці', 'в карточке', 'но тут', 'але тут',
+    'тут вказано', 'тут же вказано', 'тут написано', 'тут же написано', 'здесь указано', 'здесь написано',
+    'на картці', 'в карточке', 'но тут', 'але тут', 'а тут',
     'чому для', 'почему для', 'це ж для', 'это же для', 'але він для', 'но он для',
     'але це для', 'но это для', 'хіба це', 'разве это',
     'підійде', 'підходить', 'подойдет', 'почему вы рекомендовали', 'чому ви порадили',
@@ -399,16 +411,93 @@ function isQuestionAboutLastRecommendation(text, lastRecommendation) {
 }
 
 function isAlternativeRequest(text) {
-  const normalized = text.toLocaleLowerCase('uk-UA').replace(/[’']/g, '');
+  const normalized = normalizeMessage(text);
   return includesAny(normalized, [
     'інший варіант', 'інший маринад', 'ще варіант', 'ще один',
     'другой вариант', 'другой маринад', 'есть другой', 'є інший',
   ]);
 }
 
-function explainLastRecommendation(lastRecommendation) {
-  const intent = getProteinIntentById(lastRecommendation.requestedProtein);
+function analyzeConversationIntent(text, lastRecommendation = null) {
+  const normalized = normalizeMessage(text);
+  const currentPreferences = analyzePreferences(text);
+  const hasGratitude = includesAny(normalized, [
+    'дякую', 'спасибо', 'спасибі', 'благодар', 'мерсі', 'thanks',
+  ]);
+  const hasNegativeSentiment = includesAny(normalized, [
+    'нічого не розумі', 'ничего не понима', 'що за маяч', 'что за бред', 'фігн', 'фигн',
+    'хрінь', 'хрень', 'дурн', 'дурац', 'блін', 'блин', 'знущає', 'издевае',
+    'не подобається', 'не нравится', 'знову не те', 'опять не то', 'не підійш', 'не подош',
+  ]);
+  const hasParameterRequest = Boolean(
+    currentPreferences.proteinIntent
+    || currentPreferences.tasteIntent
+    || currentPreferences.type
+    || currentPreferences.color
+    || currentPreferences.unsupportedColor
+    || currentPreferences.flavors.length
+    || currentPreferences.sweetness !== null
+    || currentPreferences.spiciness !== null,
+  );
+  const hasAlternative = isAlternativeRequest(text);
+  const hasExplicitRequest = includesAny(normalized, [
+    'потрібен', 'потрібна', 'потрібно', 'нужен', 'нужна', 'хочу', 'покажи', 'покажіть',
+    'підбери', 'підберіть', 'порадь', 'посоветуй', 'є маринад', 'есть маринад',
+    'а є', 'чи є', 'а есть', 'есть ли',
+  ]);
+  const hasRequest = hasParameterRequest || hasAlternative || hasExplicitRequest;
+  const referencesLastRecommendation = isQuestionAboutLastRecommendation(text, lastRecommendation)
+    && !hasExplicitRequest
+    && !hasAlternative;
+
+  let intent = 'small_talk';
+  if (referencesLastRecommendation) intent = 'last_recommendation_question';
+  else if (hasRequest && hasNegativeSentiment) intent = 'complaint_with_request';
+  else if (hasRequest && hasGratitude) intent = 'gratitude_with_request';
+  else if (hasRequest) intent = 'product_request';
+  else if (hasNegativeSentiment) intent = 'pure_complaint';
+  else if (hasGratitude) intent = 'pure_gratitude';
+
+  return {
+    intent,
+    hasRequest,
+    hasGratitude,
+    hasNegativeSentiment,
+    referencesLastRecommendation,
+    currentPreferences,
+  };
+}
+
+function gratitudeResponse(lastRecommendation = null) {
+  return {
+    message: 'Дякую! Якщо знадобиться допомога з підбором маринаду — звертайтеся.',
+    question: null,
+    products: [],
+    recommendationContext: lastRecommendation,
+  };
+}
+
+function complaintResponse(preferences, lastRecommendation = null) {
+  let question = 'Що саме потрібно змінити у підборі?';
+  if (!preferences.proteinIntent) question = 'Для якого продукту підбираємо маринад?';
+  else if (!preferences.type) question = 'Вам потрібен сухий чи рідкий маринад?';
+  else if (!preferences.tasteIntent) {
+    question = 'Який смаковий напрямок вам ближчий: фруктовий, трав’яний, гострий, солодкий чи димний?';
+  }
+
+  return {
+    message: 'Розумію, що попередня відповідь вам не підійшла. Спробуймо точніше.',
+    question,
+    products: [],
+    recommendationContext: lastRecommendation,
+  };
+}
+
+function explainLastRecommendation(lastRecommendation, comparisonIntent = null) {
+  const intent = comparisonIntent || getProteinIntentById(lastRecommendation.requestedProtein);
   if (!intent) return '';
+  const product = catalogById.get(lastRecommendation.productIds[0]);
+  const matchType = comparisonIntent ? proteinMatchType(product, intent) : lastRecommendation.matchType;
   const tasteIntent = getTasteIntent(
     lastRecommendation.requestedTasteDirection,
     lastRecommendation.requestedTasteProfile,
@@ -416,10 +505,10 @@ function explainLastRecommendation(lastRecommendation) {
   const tasteSuffix = tasteIntent
     ? ` з потрібним вам ${tasteIntent.profile ? `смаком «${tasteIntent.profileLabel}»` : `смаковим напрямком «${tasteIntent.directionLabel}»`}`
     : '';
-  if (lastRecommendation.matchType === 'exact') {
+  if (matchType === 'exact') {
     return `Так, у картці вказана загальна категорія «${intent.proteinGroupLabel}». ${intent.proteinLabel} належить до неї, тому рекомендація відповідає вашому запиту.`;
   }
-  if (lastRecommendation.matchType === 'different-protein') {
+  if (matchType === 'different-protein') {
     const meatLabels = { chicken: 'курки', pork: 'свинини', fish: 'риби' };
     const taste = catalogById.get(lastRecommendation.productIds[0])?.flavors[0] || 'потрібним профілем';
     return `Так, ви праві. Це маринад для ${meatLabels[lastRecommendation.catalogProtein]}. Для ${intent.proteinGenitive} потрібного смакового варіанта в каталозі немає, тому я запропонував його лише як найближчу альтернативу за смаком «${taste}», а не як точний збіг за продуктом.`;
@@ -534,7 +623,7 @@ function hasUsefulPreferences(preferences) {
   );
 }
 
-function buildCompatibilityContext(preferences, lastRecommendation = null) {
+function buildCompatibilityContext(preferences, lastRecommendation = null, conversationIntent = null) {
   const intent = preferences.proteinIntent;
   const conversationContext = {
     requestedProtein: intent?.protein || null,
@@ -558,6 +647,13 @@ function buildCompatibilityContext(preferences, lastRecommendation = null) {
       matchLevel: lastRecommendation.matchLevel,
       requestedTasteDirection: lastRecommendation.requestedTasteDirection,
       requestedTasteProfile: lastRecommendation.requestedTasteProfile,
+    } : null,
+    conversationalIntent: conversationIntent ? {
+      intent: conversationIntent.intent,
+      hasRequest: conversationIntent.hasRequest,
+      hasGratitude: conversationIntent.hasGratitude,
+      hasNegativeSentiment: conversationIntent.hasNegativeSentiment,
+      referencesLastRecommendation: conversationIntent.referencesLastRecommendation,
     } : null,
   };
 
@@ -643,9 +739,15 @@ export default async function handler(request, response) {
     });
   }
 
-  if (isQuestionAboutLastRecommendation(message, lastRecommendation)) {
+  const conversationIntent = analyzeConversationIntent(message, lastRecommendation);
+
+  if (conversationIntent.referencesLastRecommendation) {
+    const normalized = normalizeMessage(message);
+    const comparisonIntent = includesAny(normalized, ['я просив', 'я просила', 'я просил'])
+      ? null
+      : conversationIntent.currentPreferences.proteinIntent;
     return sendJson(response, 200, {
-      message: explainLastRecommendation(lastRecommendation),
+      message: explainLastRecommendation(lastRecommendation, comparisonIntent),
       question: null,
       products: [],
       recommendationContext: lastRecommendation,
@@ -653,6 +755,12 @@ export default async function handler(request, response) {
   }
 
   const preferences = mergeConversationPreferences(history, message, lastRecommendation);
+  if (conversationIntent.intent === 'pure_gratitude') {
+    return sendJson(response, 200, gratitudeResponse(lastRecommendation));
+  }
+  if (conversationIntent.intent === 'pure_complaint') {
+    return sendJson(response, 200, complaintResponse(preferences, lastRecommendation));
+  }
   if (isAlternativeRequest(message) && lastRecommendation) {
     preferences.excludedProductIds = lastRecommendation.productIds;
   }
@@ -671,7 +779,7 @@ export default async function handler(request, response) {
     const groq = new Groq({ apiKey: process.env.GROQ_API_KEY, maxRetries: 0 });
     const providerMessages = [
       { role: 'system', content: systemInstruction },
-      { role: 'system', content: buildCompatibilityContext(preferences, lastRecommendation) },
+      { role: 'system', content: buildCompatibilityContext(preferences, lastRecommendation, conversationIntent) },
       ...history,
       { role: 'user', content: message },
     ];
@@ -732,6 +840,7 @@ function parseBody(value) {
 }
 
 export const __testables = {
+  analyzeConversationIntent,
   analyzePreferences,
   buildCompatibilityContext,
   compatibilityExplanation,
@@ -742,5 +851,7 @@ export const __testables = {
   rankProducts,
   sanitizeLastRecommendation,
   isQuestionAboutLastRecommendation,
+  complaintResponse,
+  gratitudeResponse,
   toBrowserResponse,
 };
